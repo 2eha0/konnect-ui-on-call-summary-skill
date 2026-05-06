@@ -40,15 +40,26 @@ The OAuth scopes needed by this skill (all included in the default scope set gra
 - `notebooks_read`, `notebooks_write`
 - `incident_read`
 
-### 2. Python 3
+### 2. `gh` CLI (GitHub)
 
-The skill pipes JSON through small `python3` snippets to extract fields. macOS and most Linux dev machines ship with this; no additional packages required.
+The CI section of the report queries the [`kong-konnect/konnect-ui-apps`](https://github.com/kong-konnect/konnect-ui-apps) repo for failed CI runs on `main`. Install via `brew install gh` (macOS) and authenticate:
 
-### 3. Access to Konnect's Datadog org
+```bash
+gh auth login
+gh auth status   # confirm logged in to github.com
+```
+
+You need read access to `kong-konnect/konnect-ui-apps`. If `gh` is missing or unauthenticated, the rest of the report still works — the CI section just shows a hint to set it up. Pass `--skip-ci` to skip the lookup entirely.
+
+### 3. Python 3
+
+The skill is a single Python script using only the standard library. macOS and most Linux dev machines ship with this; no `pip install` required.
+
+### 4. Access to Konnect's Datadog org
 
 The skill targets the konnect-ui RUM application (`6e430333-9e0f-4d6b-ac63-5f7d4ad9a641`) under the Kong production Datadog org. You need an account with read access to this org's RUM data and notebooks.
 
-### 4. Claude Code
+### 5. Claude Code
 
 You need [Claude Code](https://claude.com/claude-code) installed. The skill is loaded from `~/.claude/skills/` (user-global) or `.claude/skills/` (project-local).
 
@@ -125,7 +136,7 @@ The format is fixed by `scripts/oncall.py` — every report has the same three s
 |---------|---------|
 | **Incidents** | Datadog incidents created during the window. Empty section says `No incidents affecting <MFE> in this period.` |
 | **Errors** | One subsection per non-blacklisted RUM error bucket. Each has a DD deep link (2-minute window around a representative event) and one line: `<N> occurrences.` Title is the first line of the raw error message, capped at 120 chars. |
-| **CI** | Defaults to `No CI issues observed during this week. Failed tests all passed on reruns.` Extend by editing the markdown during preview. |
+| **CI** | Failed CI runs on `main` of `kong-konnect/konnect-ui-apps` affecting this MFE, queried via `gh`. The script filters to jobs named `mfe (<MFE>) / <step>` in the shared `CI` workflow plus any failed jobs in MFE-specific workflows (e.g. `Gateway Manager Plugin Tests Scheduler`). Cascade jobs (`check-dev-stage`, `check-prod-stage`, `Collect results`, `Slack Notification`) are dropped. Empty section says "No CI failures on `main` affecting `<MFE>` this week." |
 
 ### Filtering: blacklist only
 
@@ -141,6 +152,8 @@ A trailing HTML comment in the report tallies how many events were filtered: `<!
 ### Other knobs
 
 - `--min-count N` (default 2) — drop buckets with fewer than N occurrences. Filters one-off truncated log lines pup occasionally indexes as errors. Set to 1 to include every non-blacklisted bucket.
+- `--skip-ci` — skip the GitHub CI lookup. Useful if `gh` isn't installed/authenticated, or to speed up the run.
+- `--ci-run-limit N` (default 30) — max number of failed CI runs to inspect. Each is a ~30s `gh run view` API call (parallelized 8-wide via `ThreadPoolExecutor`); the default ≈ 2 minutes wall-clock on a busy week. Bump for thoroughness on extreme weeks, lower for speed.
 
 ## Customization
 
@@ -156,9 +169,9 @@ The trigger phrases (which determine when Claude activates the skill) live in `S
 
 ## Limitations
 
-- **Aggregation key is exact `@error.message`.** Errors that include resource IDs in the message (e.g., `… for <uuid> …`) become many distinct buckets. The script still classifies each bucket via regex and merges them under a shared category, but the per-bucket count appears once per merged category.
+- **Aggregation key is exact `@error.message`.** Errors that include resource IDs (e.g., `… for <uuid> …`) become many distinct buckets. Most are caught by `NOISE` regexes; the rest are listed individually.
 - **DD deep links land on a time range, not a specific event.** The link uses a 2-minute window around the representative event because pup doesn't expose the encoded `event=` token. Reviewers click through and see the matching events listed in the side panel.
-- **No CI integration.** The skill always emits the "No CI issues observed" placeholder. If your team has a different default or a CI source to query, edit `cmd_collect` or extend the skill.
+- **CI lookup is konnect-ui-apps-specific.** The skill hardcodes `kong-konnect/konnect-ui-apps` and the job-name convention `mfe (<MFE>) / <step>`. For a different repo or naming scheme, edit `GITHUB_REPO`, `SHARED_CI_WORKFLOW`, and the relevant filtering logic in `scripts/oncall.py`.
 - **Konnect-ui is the default RUM app.** For MFEs in other apps (admin-konnect-ui, portal-nuxt, kong-manager-oss, …), pass `--app-id`.
 
 ## Troubleshooting
@@ -167,7 +180,11 @@ The trigger phrases (which determine when Claude activates the skill) live in `S
 
 **Empty Errors section** — `service:<MFE>` matched no error events in the window. Confirm the MFE name (the `service` tag in RUM is usually identical to the MFE name) and try `--app-id` if it's not under konnect-ui.
 
-**`### IDs: [` or other malformed-looking titles** — those are real "unknown" buckets the script couldn't classify. Edit them away during preview, or add a regex to `PATTERNS` / `NOISE` if they should be auto-handled going forward.
+**`### IDs: [` or other malformed-looking titles** — those are bucket messages with junky prefixes. Edit them away during preview, or add a regex to `NOISE` if they should be auto-hidden going forward.
+
+**CI section says "lookup unavailable"** — run `gh auth status`. If not logged in, `gh auth login`. If logged in but the lookup fails, you may not have read access to `kong-konnect/konnect-ui-apps`. To skip CI entirely, pass `--skip-ci`.
+
+**CI lookup is slow** — `gh run view` is ~30s per call because each CI workflow run has 700+ jobs. The script parallelizes 8-wide via `ThreadPoolExecutor`, so 30 runs ≈ 2 minutes wall-clock. Pass `--ci-run-limit 10` for speed, `--skip-ci` to skip entirely, or accept the wait if you want completeness.
 
 **Skill doesn't activate on your phrase** — the skill triggers on "on-call summary", "周报", "weekly report", and MFE names. If your team uses different terms, edit the `description` in `SKILL.md`.
 

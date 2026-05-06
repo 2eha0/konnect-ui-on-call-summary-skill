@@ -11,7 +11,7 @@ Drafts and creates the team's standard weekly on-call summary notebook for a Kon
 
 1. **Always preview before creating.** Never run `oncall.py create` (or `pup notebooks create`) until the user explicitly approves the draft (e.g., "yes", "create it", "go ahead", "好的", "创建吧"). If the user requests edits, revise the markdown buffer and re-preview.
 2. **Show the script's stdout verbatim.** The format is fixed by the script. Do not summarize, reorder, or add interpretive context to the draft. If the user wants extra text (e.g., a CI note), append/edit explicitly on their request.
-3. **Two bash calls per session.** All pup queries are wrapped by the script — don't shell out to `pup` directly except for `pup auth login` / `pup auth refresh` if the user needs to re-authenticate.
+3. **Two bash calls per session.** All pup and gh queries are wrapped by the script — don't shell out to `pup` or `gh` directly except for `pup auth login` / `pup auth refresh` / `gh auth login` if the user needs to re-authenticate.
 
 ## Triggers
 
@@ -38,6 +38,8 @@ Optional flags:
 - `--week-of YYYY-MM-DD` — Monday of the target week. Default: previous fully-completed Mon–Sun week.
 - `--app-id <UUID>` — non-default RUM application ID. Default: konnect-ui (`6e430333-9e0f-4d6b-ac63-5f7d4ad9a641`), which covers gateway-manager / mesh-manager / ai-manager / analytics / etc.
 - `--min-count N` — drop buckets with fewer than this many occurrences (default 2). Filters one-off truncated log lines that pup occasionally indexes as errors.
+- `--skip-ci` — skip the GitHub CI lookup. Use if `gh` isn't installed/authenticated, or to speed up the run.
+- `--ci-run-limit N` — max number of failed CI runs to inspect (default 30). Each is a ~30s API call, parallelized 8-wide. Bump for very busy weeks; lower for speed.
 
 The script:
 
@@ -47,10 +49,13 @@ The script:
 4. Drops buckets below `--min-count` to filter low-volume noise.
 5. Lists every remaining bucket as a section in the report, using the first line of its raw error message as the title. No further classification or canned wording.
 6. Pulls one representative event per bucket for the DD deep link.
-7. Looks up incidents in the window.
-8. Prints the markdown report. A trailing HTML comment notes how many events were filtered as blacklisted.
+7. Looks up Datadog incidents in the window.
+8. Queries GitHub via `gh` for failed CI runs on `main` of `kong-konnect/konnect-ui-apps` in the window. Filters to jobs named `mfe (<MFE>) /<step>` (within the shared `CI` workflow) plus any failed jobs in MFE-specific workflows. Cascade jobs (`check-dev-stage`, `check-prod-stage`, `Collect results`, `Slack Notification`) are dropped to keep the focus on the actual broken steps.
+9. Prints the markdown report. A trailing HTML comment notes how many error events were filtered as blacklisted.
 
 **Pure blacklist semantics.** There is no whitelist or per-category formatting. New error types appear automatically with their raw message. To hide an error type going forward, add its regex to the `NOISE` list in `scripts/oncall.py`.
+
+The CI query needs an authenticated `gh` (run `gh auth status` to verify). If `gh` is unavailable, the CI section says so but the rest of the report still produces.
 
 ### Step 2 — Preview to the user
 
@@ -103,8 +108,11 @@ The script always emits this skeleton:
 
 # CI
 
-No CI issues observed during this week. Failed tests all passed on reruns.
+- `<failed step name>` — N failure(s) on `main` ([latest](url) YYYY-MM-DD)
+- …
 ```
+
+If `gh` is unavailable, the CI section says so. If no CI failures match the MFE, it says "No CI failures on `main` affecting `<MFE>` this week."
 
 One list in `scripts/oncall.py` drives the behavior:
 
@@ -129,7 +137,9 @@ To hide more error types going forward, add their regex to `NOISE`. To stop hidi
 
 ## Common pitfalls
 
-- **Auth expired mid-session.** The script prints `pup auth failed. Run pup auth refresh…`. Tell the user; they need to run it themselves (interactive). Re-run step 1.
+- **pup auth expired mid-session.** The script prints `pup auth failed. Run pup auth refresh…`. Tell the user; they need to run it themselves (interactive). Re-run step 1.
+- **gh not authenticated.** The CI section will show "lookup unavailable". Tell the user to run `gh auth login`, or pass `--skip-ci` to skip the lookup.
+- **CI lookup is slow on a busy week.** Each relevant failed run takes one ~30s `gh run view` API call. Calls run 8-wide via `ThreadPoolExecutor`, so ~30 runs ≈ 2 minutes total. The user can pass `--skip-ci` (fill CI manually) or `--ci-run-limit N` (cap inspection) to trade thoroughness for speed.
 - **Empty errors section.** Means `service:<MFE>` had no error events in the window. Confirm the MFE name and try `--app-id` if it's not under konnect-ui.
-- **`### IDs: [` or other malformed titles.** These are real "unknown" buckets — usually short prefixes from custom error logs. The user may want to drop or rewrite them in step 2.
+- **`### IDs: [` or other malformed titles.** These are bucket messages with junky prefixes. The user may want to drop them in step 2.
 - **Don't fabricate context.** "This same error showed up the previous week" or "this is a regression from PR #X" are claims you can't verify from the data alone. Stick to the script's wording unless the user adds context themselves.

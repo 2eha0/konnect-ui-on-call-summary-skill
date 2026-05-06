@@ -20,9 +20,29 @@ import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 KONNECT_UI_APP_ID = "6e430333-9e0f-4d6b-ac63-5f7d4ad9a641"
+
+# GitHub repo backing the konnect-ui MFEs.
+GITHUB_REPO = "kong-konnect/konnect-ui-apps"
+# The shared CI workflow runs every MFE; MFE-specific failures are job names
+# of the form "mfe (<MFE>) / <step>".
+SHARED_CI_WORKFLOW = "CI"
+# Cascade jobs that always fail when an upstream test fails — uninformative
+# on their own. We hide them so the report shows the actual broken step.
+CI_CASCADE_STEPS = {
+    "check-dev-stage",
+    "check-prod-stage",
+    "Collect results",
+    "Slack Notification",
+}
+# How many failed CI runs to inspect per session. Each run = one ~30s gh API
+# call, parallelized via ThreadPoolExecutor. 30 covers a normal week well; on
+# very busy weeks the user can pass --ci-run-limit higher.
+CI_RUN_LIMIT_DEFAULT = 30
+CI_PARALLEL_WORKERS = 8
 
 # Display name overrides for MFEs whose default title-casing isn't right.
 MFE_DISPLAY = {
@@ -123,6 +143,36 @@ def is_blacklisted(message: str) -> bool:
     return any(n.search(message) for n in NOISE)
 
 
+def run_gh(args: list[str]) -> object:
+    """Best-effort `gh` invocation. Returns parsed JSON on success, None on
+    any failure (gh not installed, not authenticated, network error, etc.)."""
+    try:
+        result = subprocess.run(
+            ["gh", *args], capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout) if result.stdout.strip() else None
+    except json.JSONDecodeError:
+        return None
+
+
+def normalize_name(s: str) -> str:
+    """Lowercase + strip non-alphanumerics, so 'Gateway Manager CI' matches 'gateway-manager'."""
+    return re.sub(r"[\W_]+", "", s.lower())
+
+
+def workflow_is_relevant(wf_name: str, mfe: str) -> bool:
+    """A workflow is relevant if it's the shared CI workflow (any MFE may
+    have failed jobs in it) or the MFE name appears in the workflow name."""
+    if wf_name == SHARED_CI_WORKFLOW:
+        return True
+    return normalize_name(mfe) in normalize_name(wf_name)
+
+
 def title_from_message(message: str) -> str:
     """First line of the message, capped at 120 chars."""
     return (message.splitlines() or [""])[0].strip()[:120]
@@ -202,6 +252,95 @@ def fetch_sample(app_id: str, mfe: str, msg: str, start: datetime, end: datetime
     }
 
 
+def fetch_failed_jobs(run_id: int | str) -> list[str] | None:
+    """Return failed job names for a single workflow run, or None on error.
+
+    Uses --jq server-side to drop everything we don't need so the response
+    stays small (a typical CI run has 700+ jobs).
+    """
+    try:
+        result = subprocess.run([
+            "gh", "run", "view", str(run_id),
+            "--repo", GITHUB_REPO,
+            "--json", "jobs",
+            "--jq", '.jobs[] | select(.conclusion=="failure") | .name',
+        ], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def fetch_ci_failures(mfe: str, start: datetime, end: datetime,
+                      run_limit: int = CI_RUN_LIMIT_DEFAULT) -> list[dict] | None:
+    """Query GitHub for failed CI runs on main affecting this MFE.
+
+    Returns:
+        list of {workflow, step, count, latest_url, latest_date} entries on
+        success (possibly empty), or None if gh is unavailable/unauthenticated.
+    """
+    runs = run_gh([
+        "run", "list",
+        "--repo", GITHUB_REPO,
+        "--branch", "main",
+        "--status", "failure",
+        "--created", f"{start.strftime('%Y-%m-%d')}..{end.strftime('%Y-%m-%d')}",
+        "--limit", str(run_limit),
+        "--json", "databaseId,workflowName,createdAt,url",
+    ])
+    if runs is None:
+        return None
+
+    relevant = [r for r in runs if workflow_is_relevant(r.get("workflowName", ""), mfe)]
+    if not relevant:
+        return []
+
+    print(f"oncall.py: inspecting {len(relevant)} CI run(s) "
+          f"(parallelized, {CI_PARALLEL_WORKERS} workers)…", file=sys.stderr)
+
+    # Fetch failed job lists in parallel — each gh run view is ~30s.
+    with ThreadPoolExecutor(max_workers=CI_PARALLEL_WORKERS) as pool:
+        jobs_by_run = list(pool.map(
+            lambda r: (r, fetch_failed_jobs(r["databaseId"])),
+            relevant,
+        ))
+
+    mfe_marker = f"mfe ({mfe}) /"
+    by_step: dict[tuple[str, str], dict] = {}
+
+    # `relevant` is already sorted most-recent-first by gh, so the first time
+    # we see a (workflow, step) pair, the run's URL/date are the latest.
+    for run, failed_names in jobs_by_run:
+        if failed_names is None:
+            continue
+        wf_name = run.get("workflowName", "")
+        for job_name in failed_names:
+            if wf_name == SHARED_CI_WORKFLOW:
+                if mfe_marker not in job_name:
+                    continue
+                step = job_name.split(" / ", 1)[1] if " / " in job_name else job_name
+            else:
+                step = job_name
+            if step in CI_CASCADE_STEPS:
+                continue
+
+            key = (wf_name, step)
+            entry = by_step.get(key)
+            if entry is None:
+                by_step[key] = {
+                    "workflow": wf_name,
+                    "step": step,
+                    "count": 1,
+                    "latest_url": run.get("url", ""),
+                    "latest_date": (run.get("createdAt") or "")[:10],
+                }
+            else:
+                entry["count"] += 1
+
+    return list(by_step.values())
+
+
 def fetch_incidents(start: datetime, end: datetime) -> list[dict]:
     out = run_pup(["incidents", "list", "--limit", "50"])
     items = out.get("data", {}).get("attributes", {}).get("incidents", []) or []
@@ -256,6 +395,10 @@ def cmd_collect(args: argparse.Namespace) -> None:
         e["dd_link"] = dd_link(args.app_id, args.mfe, anchor)
 
     incidents = fetch_incidents(start, end)
+    ci_failures = (
+        None if args.skip_ci
+        else fetch_ci_failures(args.mfe, start, end, run_limit=args.ci_run_limit)
+    )
     name = display_name(args.mfe)
 
     out: list[str] = []
@@ -292,7 +435,22 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
     out.append("# CI")
     out.append("")
-    out.append("No CI issues observed during this week. Failed tests all passed on reruns.")
+    if ci_failures is None:
+        # gh missing/unauthenticated, or --skip-ci; leave the user a hint.
+        out.append(
+            "(CI lookup skipped or unavailable — run `gh auth status` to verify access "
+            f"to `{GITHUB_REPO}`.)"
+        )
+    elif not ci_failures:
+        out.append(f"No CI failures on `main` affecting {name} this week.")
+    else:
+        for cf in sorted(ci_failures, key=lambda x: -x["count"]):
+            s = "s" if cf["count"] != 1 else ""
+            wf_prefix = "" if cf["workflow"] == SHARED_CI_WORKFLOW else f"{cf['workflow']}: "
+            out.append(
+                f"- `{wf_prefix}{cf['step']}` — {cf['count']} failure{s} on `main` "
+                f"([latest]({cf['latest_url']}) {cf['latest_date']})"
+            )
 
     print("\n".join(out))
 
@@ -357,6 +515,15 @@ def main() -> None:
                     help="Drop error buckets with fewer than this many "
                          "occurrences (default: 2). Set to 1 to include every "
                          "non-blacklisted error.")
+    pc.add_argument("--skip-ci", action="store_true",
+                    help="Skip GitHub CI lookup. Useful if gh isn't installed "
+                         "or authenticated, or to speed up the run.")
+    pc.add_argument("--ci-run-limit", type=int, default=CI_RUN_LIMIT_DEFAULT,
+                    help=f"Max number of failed CI runs to inspect "
+                         f"(default: {CI_RUN_LIMIT_DEFAULT}). Each run = one "
+                         f"~30s gh API call, parallelized "
+                         f"{CI_PARALLEL_WORKERS}-wide. Bump for very busy "
+                         f"weeks; lower for speed.")
     pc.set_defaults(func=cmd_collect)
 
     pn = sub.add_parser("create", help="Create the Datadog notebook from a markdown file")
