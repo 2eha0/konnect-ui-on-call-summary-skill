@@ -124,22 +124,30 @@ The format is fixed by `scripts/oncall.py` — every report has the same three s
 | Section | Content |
 |---------|---------|
 | **Incidents** | Datadog incidents created during the window. Empty section says `No incidents affecting <MFE> in this period.` |
-| **Errors** | One subsection per **noteworthy** RUM error category — real bugs, performance issues, build/CSP problems. Each has a DD deep link (2-minute window around a representative event) and one canned line: `<N> occurrences. <fixed wording>`. |
+| **Errors** | One subsection per non-blacklisted RUM error bucket. Each has a DD deep link (2-minute window around a representative event) and one line: `<N> occurrences.` Title is the first line of the raw error message, capped at 120 chars. |
 | **CI** | Defaults to `No CI issues observed during this week. Failed tests all passed on reruns.` Extend by editing the markdown during preview. |
 
-The default view is **focused** — matches the team's existing on-call notebooks at 3–6 categories. Routine errors (401 session timeouts, 403 permission denials, 404 stale links, navigation cancels) are tagged `noteworthy: False` and folded into a single footnote: `<!-- N additional event(s) across M expected/low-signal categories hidden — re-run with --all to include them. -->`. Pure noise (chrome-extension errors, `Unable to preload CSS`, browser intervention warnings, ResizeObserver loops) is dropped before classification.
+### Filtering: blacklist only
 
-To see the full breakdown, pass `--all`. To tune the threshold for low-volume unrecognized errors, pass `--min-unknown-count N` (default 3).
+The script uses a **single blacklist** (`NOISE` in `scripts/oncall.py`). Anything matching it is dropped; everything else appears in the report with its raw message. There is no whitelist, no per-category formatting, and no classification — new error patterns surface automatically.
 
-The full pattern list lives in `scripts/oncall.py`'s `PATTERNS`. Each entry has a `regex`, fixed `title`, fixed `wording`, and `noteworthy: bool`. First match wins.
+The blacklist covers two tiers:
+
+1. **Browser/extension noise** — `chrome-extension://`, `Unable to preload CSS`, `intervention: Ignored attempt to cancel`, `ResizeObserver loop`. No signal value.
+2. **Known recurring errors** — `AxiosError ... 401/403/404`, `Failed to fetch dimensions ... CanceledError: canceled`, `Failed to fetch dynamically imported module`, `csp_violation:`. The team has decided these don't merit weekly mention.
+
+A trailing HTML comment in the report tallies how many events were filtered: `<!-- N blacklisted event(s) filtered (see scripts/oncall.py NOISE list). -->`.
+
+### Other knobs
+
+- `--min-count N` (default 2) — drop buckets with fewer than N occurrences. Filters one-off truncated log lines pup occasionally indexes as errors. Set to 1 to include every non-blacklisted bucket.
 
 ## Customization
 
-To change patterns, descriptions, MFE display names, or the report skeleton, edit `skills/konnect-ui-on-call-summary/scripts/oncall.py`:
+Edit `skills/konnect-ui-on-call-summary/scripts/oncall.py`:
 
-- **Add or refine a category** — append to `PATTERNS`. Set `noteworthy: True` if it should always show, `False` if it's expected/routine. Order matters; place specific regexes before generic ones.
-- **Drop a noise pattern** — append to `NOISE`. Anything matching is excluded entirely.
-- **Promote an existing routine pattern** — flip `noteworthy: False → True` on the entry (e.g., if 404s suddenly become a real concern for your team).
+- **Hide a recurring error from reports** — append its regex to `NOISE`.
+- **Stop hiding something** — comment out its entry in `NOISE`.
 - **Override an MFE's display name** — extend `MFE_DISPLAY` (used in titles and notebook names).
 - **Change the report skeleton** — edit `cmd_collect` (the function that prints the markdown).
 - **Use a different RUM app** — pass `--app-id <UUID>` at the CLI, or change `KONNECT_UI_APP_ID`.

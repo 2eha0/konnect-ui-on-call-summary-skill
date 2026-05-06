@@ -37,20 +37,20 @@ Optional flags:
 
 - `--week-of YYYY-MM-DD` — Monday of the target week. Default: previous fully-completed Mon–Sun week.
 - `--app-id <UUID>` — non-default RUM application ID. Default: konnect-ui (`6e430333-9e0f-4d6b-ac63-5f7d4ad9a641`), which covers gateway-manager / mesh-manager / ai-manager / analytics / etc.
-- `--all` — include expected/low-signal categories (401 session timeouts, 403/404, navigation cancels, low-volume unknowns). Default keeps only noteworthy categories.
-- `--min-unknown-count N` — minimum count for unclassified errors to appear in the default view (default 3).
+- `--min-count N` — drop buckets with fewer than this many occurrences (default 2). Filters one-off truncated log lines that pup occasionally indexes as errors.
 
 The script:
 
 1. Verifies pup auth (aborts with a clear message if expired).
 2. Aggregates RUM errors by `@error.message` for `service:<MFE_NAME>` in the window.
-3. Classifies each bucket against a fixed pattern table. Each pattern is tagged `noteworthy: True/False`. **By default only noteworthy categories are shown** (real bugs, perf issues, build/CSP issues). Routine errors (auth flow, permission denials, navigation cancels) are hidden under a footnote.
-4. Drops noise outright: chrome-extension errors, preload-CSS warnings, intervention warnings, ResizeObserver loops.
-5. Pulls one representative event per shown category for the DD deep link (exact-message match).
-6. Looks up incidents in the window.
-7. Prints the markdown report to stdout in the team's fixed format. A trailing HTML comment summarizes how many events/categories were hidden.
+3. **Drops blacklisted buckets** (the `NOISE` list in `scripts/oncall.py`): browser/extension noise *plus* known recurring errors that don't merit weekly mention (401/403/404, navigation cancels, dynamic-import retries, CSP violations).
+4. Drops buckets below `--min-count` to filter low-volume noise.
+5. Lists every remaining bucket as a section in the report, using the first line of its raw error message as the title. No further classification or canned wording.
+6. Pulls one representative event per bucket for the DD deep link.
+7. Looks up incidents in the window.
+8. Prints the markdown report. A trailing HTML comment notes how many events were filtered as blacklisted.
 
-Use `--all` only when the user explicitly asks to see everything (e.g., "show me the full breakdown"). The default is the focused view that matches the team's existing on-call notebooks.
+**Pure blacklist semantics.** There is no whitelist or per-category formatting. New error types appear automatically with their raw message. To hide an error type going forward, add its regex to the `NOISE` list in `scripts/oncall.py`.
 
 ### Step 2 — Preview to the user
 
@@ -106,23 +106,26 @@ The script always emits this skeleton:
 No CI issues observed during this week. Failed tests all passed on reruns.
 ```
 
-Categories the script knows:
+One list in `scripts/oncall.py` drives the behavior:
 
-| ID | Default | Title | Wording |
-|---|---|---|---|
-| `axios_timeout` | shown | `AxiosError: timeout of 30000ms exceeded` | "Network issue or slow upstream API." |
-| `get_computed_style` | shown | `TypeError: Failed to execute 'getComputedStyle' on 'Window'…` | "Component unmounted before style read. Does not affect user interaction." |
-| `dynamic_import_failed` | shown | `TypeError: Failed to fetch dynamically imported module` | "Bundle chunk fetch failed; usually a stale client after a deploy." |
-| `csp_violation` | shown | `csp_violation: script blocked by CSP` | "Content Security Policy blocked a script load. **Investigate** if recurring." |
-| `undefined_property` | shown | `TypeError: Cannot read properties of undefined (reading '<prop>')` | "Frontend bug — code accesses `.<prop>` on undefined. **Investigate.**" |
-| `session_timeout` | hidden | `AxiosError: Request failed with status code 401 (session timeout)` | "Session timeout — user navigated to the page with an expired session." |
-| `axios_403` | hidden | `AxiosError: Request failed with status code 403` | "Permission denied." |
-| `axios_404` | hidden | `AxiosError: Request failed with status code 404` | "Resource not found." |
-| `canceled_dimensions` | hidden | `Failed to fetch dimensions — CanceledError: canceled` | "Request aborted when the user navigated away…" |
+**`NOISE` — blacklist. Buckets matching any of these regexes are dropped from the report.**
 
-Anything unmatched is shown as `### <first 120 chars of message>` with wording `Unknown error pattern. **Investigate.**` — but only if its count reaches `--min-unknown-count` (default 3). Lower-volume unknowns are folded into the hidden-categories footnote.
+| Regex | Why blacklisted |
+|---|---|
+| `chrome-extension://` | Browser extension noise |
+| `Unable to preload CSS` | Bundle prefetch warning, no signal |
+| `intervention: Ignored attempt to cancel` | Browser passive-listener warning |
+| `ResizeObserver loop` | Browser layout warning, harmless |
+| `AxiosError ... status code 401` | Session timeout (expected user-flow) |
+| `AxiosError ... status code 403` | Permission denial (expected user-flow) |
+| `AxiosError ... status code 404` | Stale link (expected user-flow) |
+| `Failed to fetch dimensions ... CanceledError: canceled` | Navigation cancel (expected) |
+| `Failed to fetch dynamically imported module` | Stale client after deploy, self-healing |
+| `csp_violation:` | Recurring CSP hiccup, not actionable here |
 
-To add or change patterns/noise rules, edit `scripts/oncall.py`'s `PATTERNS` and `NOISE` lists. The `noteworthy` field on each pattern controls whether it shows by default. First match wins, so order patterns from most specific to most generic.
+Every other error bucket appears in the report as `### <first line of message, capped at 120 chars>` with the count line `<N> occurrence(s).`. No further classification. A bucket needs at least `--min-count` occurrences to appear (default 2), which filters truncated log lines pup occasionally indexes as errors.
+
+To hide more error types going forward, add their regex to `NOISE`. To stop hiding one, comment it out — it will reappear in the report on the next run.
 
 ## Common pitfalls
 

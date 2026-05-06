@@ -34,98 +34,29 @@ MFE_DISPLAY = {
     "analytics": "Analytics",
 }
 
-# Order matters: first match wins. Each entry classifies a RUM error message
-# bucket into a category with a fixed title and canned wording.
+# Blacklist — buckets matching any of these are dropped from the report.
+# Two tiers, kept together because the dropping logic is identical:
 #
-# `noteworthy` controls default visibility:
-#   True  — always shown (real bugs, perf issues, things requiring follow-up)
-#   False — shown only with --all (expected behavior: auth flow, navigation
-#           cancels, permission denials)
-PATTERNS = [
-    # ---- Expected / routine — hidden by default ----
-    {
-        "id": "session_timeout",
-        "regex": re.compile(
-            r"AxiosError[^\n]*?Request failed with status code 401",
-            re.IGNORECASE,
-        ),
-        "title": "AxiosError: Request failed with status code 401 (session timeout)",
-        "wording": "Session timeout — user navigated to the page with an expired session.",
-        "noteworthy": False,
-    },
-    {
-        "id": "axios_403",
-        "regex": re.compile(r"AxiosError[^\n]*?status code 403"),
-        "title": "AxiosError: Request failed with status code 403",
-        "wording": "Permission denied (user lacks access to the resource).",
-        "noteworthy": False,
-    },
-    {
-        "id": "axios_404",
-        "regex": re.compile(r"AxiosError[^\n]*?status code 404"),
-        "title": "AxiosError: Request failed with status code 404",
-        "wording": "Resource not found (likely deleted or stale link).",
-        "noteworthy": False,
-    },
-    {
-        "id": "canceled_dimensions",
-        "regex": re.compile(r"Failed to fetch dimensions[^\n]*?CanceledError: canceled"),
-        "title": "Failed to fetch dimensions — CanceledError: canceled",
-        "wording": (
-            "Request aborted when the user navigated away before the analytics "
-            "dimensions fetch completed. Same pattern as previous weeks."
-        ),
-        "noteworthy": False,
-    },
-    # ---- Real concerns — always shown ----
-    {
-        "id": "axios_timeout",
-        "regex": re.compile(r"AxiosError: timeout of \d+ms exceeded"),
-        "title": "AxiosError: timeout of 30000ms exceeded",
-        "wording": "Network issue or slow upstream API.",
-        "noteworthy": True,
-    },
-    {
-        "id": "get_computed_style",
-        "regex": re.compile(r"Failed to execute 'getComputedStyle' on 'Window'"),
-        "title": (
-            "TypeError: Failed to execute 'getComputedStyle' on 'Window': "
-            "parameter 1 is not of type 'Element'."
-        ),
-        "wording": "Component unmounted before style read. Does not affect user interaction.",
-        "noteworthy": True,
-    },
-    {
-        "id": "dynamic_import_failed",
-        "regex": re.compile(r"Failed to fetch dynamically imported module"),
-        "title": "TypeError: Failed to fetch dynamically imported module",
-        "wording": "Bundle chunk fetch failed; usually a stale client after a deploy. Self-healing on reload.",
-        "noteworthy": True,
-    },
-    {
-        "id": "csp_violation",
-        "regex": re.compile(r"csp_violation:"),
-        "title": "csp_violation: script blocked by CSP",
-        "wording": "Content Security Policy blocked a script load. **Investigate** if recurring (may indicate a CDN or asset-host config drift).",
-        "noteworthy": True,
-        "follow_up": True,
-    },
-    {
-        "id": "undefined_property",
-        "regex": re.compile(r"Cannot read properties of undefined \(reading '([^']+)'\)"),
-        "title": "TypeError: Cannot read properties of undefined (reading '{prop}')",
-        "wording": "Frontend bug — code accesses `.{prop}` on undefined. **Investigate.**",
-        "noteworthy": True,
-        "follow_up": True,
-    },
-]
-
-# Patterns considered noise; matches are excluded from the report entirely.
+#   1. Pure browser/extension noise (no signal value).
+#   2. Known recurring errors the team has decided don't merit weekly mention
+#      (auth/navigation/permission flow, stale-client bundle fetches, CSP
+#      hiccups, etc.).
+#
+# To stop hiding one of these, comment it out — the bucket will then appear
+# in the report with its raw message.
 NOISE = [
+    # ---- Browser / extension noise ----
     re.compile(r"chrome-extension://"),
     re.compile(r"Unable to preload CSS"),
     re.compile(r"intervention: Ignored attempt to cancel"),
     re.compile(r"ResizeObserver loop"),
+    # ---- Known recurring, not actionable ----
+    re.compile(r"AxiosError[^\n]*?Request failed with status code 401", re.IGNORECASE),
+    re.compile(r"AxiosError[^\n]*?Request failed with status code 403"),
+    re.compile(r"AxiosError[^\n]*?Request failed with status code 404"),
+    re.compile(r"Failed to fetch dimensions[^\n]*?CanceledError: canceled"),
+    re.compile(r"Failed to fetch dynamically imported module"),
+    re.compile(r"csp_violation:"),
 ]
 
 
@@ -188,30 +119,13 @@ def display_name(mfe: str) -> str:
     return MFE_DISPLAY.get(mfe) or " ".join(p.capitalize() for p in mfe.split("-"))
 
 
-def classify(message: str) -> dict | None:
-    for n in NOISE:
-        if n.search(message):
-            return None
-    for p in PATTERNS:
-        m = p["regex"].search(message)
-        if not m:
-            continue
-        ctx = {"prop": m.group(1) if m.groups() else ""}
-        return {
-            "id": p["id"],
-            "title": p["title"].format(**ctx),
-            "wording": p["wording"].format(**ctx),
-            "follow_up": p.get("follow_up", False),
-            "noteworthy": p.get("noteworthy", True),
-        }
-    return {
-        "id": f"unknown::{message[:60]}",
-        "title": message.split("\n")[0][:120],
-        "wording": "Unknown error pattern. **Investigate.**",
-        "follow_up": True,
-        "noteworthy": True,  # filtered by min_unknown_count threshold below
-        "is_unknown": True,
-    }
+def is_blacklisted(message: str) -> bool:
+    return any(n.search(message) for n in NOISE)
+
+
+def title_from_message(message: str) -> str:
+    """First line of the message, capped at 120 chars."""
+    return (message.splitlines() or [""])[0].strip()[:120]
 
 
 def to_epoch_ms(iso: str) -> int:
@@ -319,48 +233,27 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
     buckets = fetch_aggregate(args.app_id, args.mfe, start, end)
 
-    categories: dict[str, dict] = {}
+    entries: list[dict] = []
+    blacklisted_count = 0
     for b in buckets:
         msg = b.get("by", {}).get("@error.message", "") or ""
         count = b.get("computes", {}).get("c0", 0) or 0
         if not msg or count == 0:
             continue
-        c = classify(msg)
-        if c is None:
+        if is_blacklisted(msg):
+            blacklisted_count += count
             continue
-        cid = c["id"]
-        if cid not in categories:
-            categories[cid] = {
-                "title": c["title"],
-                "wording": c["wording"],
-                "count": 0,
-                "sample_message": msg,
-                "follow_up": c.get("follow_up", False),
-                "noteworthy": c.get("noteworthy", True),
-                "is_unknown": c.get("is_unknown", False),
-            }
-        categories[cid]["count"] += count
+        if count < args.min_count:
+            continue
+        title = title_from_message(msg)
+        if not title:
+            continue
+        entries.append({"title": title, "count": count, "sample_message": msg})
 
-    # Filter to "noteworthy" categories unless the user wants everything.
-    # Unknowns are kept only if they reach min-unknown-count (signal vs. noise).
-    if not args.all:
-        filtered = {}
-        for cid, c in categories.items():
-            if c["is_unknown"]:
-                if c["count"] >= args.min_unknown_count:
-                    filtered[cid] = c
-            elif c["noteworthy"]:
-                filtered[cid] = c
-        # Remember what was hidden so we can mention it in a footnote
-        hidden = {cid: c for cid, c in categories.items() if cid not in filtered}
-        categories = filtered
-    else:
-        hidden = {}
-
-    for c in categories.values():
-        ev = fetch_sample(args.app_id, args.mfe, c["sample_message"], start, end)
+    for e in entries:
+        ev = fetch_sample(args.app_id, args.mfe, e["sample_message"], start, end)
         anchor = ev["ts"] if ev and ev.get("ts") else start.strftime("%Y-%m-%dT%H:%M:%SZ")
-        c["dd_link"] = dd_link(args.app_id, args.mfe, anchor)
+        e["dd_link"] = dd_link(args.app_id, args.mfe, anchor)
 
     incidents = fetch_incidents(start, end)
     name = display_name(args.mfe)
@@ -377,26 +270,23 @@ def cmd_collect(args: argparse.Namespace) -> None:
 
     out.append("# Errors")
     out.append("")
-    if not categories:
+    if not entries:
         out.append("No notable errors observed during this week.")
         out.append("")
     else:
-        ordered = sorted(categories.values(), key=lambda c: -c["count"])
-        for c in ordered:
-            out.append(f"### {c['title']}")
+        for e in sorted(entries, key=lambda x: -x["count"]):
+            out.append(f"### {e['title']}")
             out.append("")
-            out.append(f"[DD Link]({c['dd_link']})")
+            out.append(f"[DD Link]({e['dd_link']})")
             out.append("")
-            stats = f"{c['count']} occurrence{'s' if c['count'] != 1 else ''}"
-            out.append(f"{stats}. {c['wording']}")
+            stats = f"{e['count']} occurrence{'s' if e['count'] != 1 else ''}"
+            out.append(f"{stats}.")
             out.append("")
 
-    if hidden:
-        # Footnote so reviewers know what was filtered, but keep it terse.
-        hidden_total = sum(c["count"] for c in hidden.values())
+    if blacklisted_count:
         out.append(
-            f"<!-- {hidden_total} additional event(s) across {len(hidden)} expected/low-signal "
-            f"categories hidden — re-run with `--all` to include them. -->"
+            f"<!-- {blacklisted_count} blacklisted event(s) filtered "
+            f"(see scripts/oncall.py NOISE list). -->"
         )
         out.append("")
 
@@ -463,13 +353,10 @@ def main() -> None:
                     help="Monday of target week (YYYY-MM-DD). "
                          "Default: previous fully-completed Mon–Sun week.")
     pc.add_argument("--app-id", default=KONNECT_UI_APP_ID, help="RUM application ID")
-    pc.add_argument("--all", action="store_true",
-                    help="Show every category, including expected/low-signal ones "
-                         "(401, 403, 404, navigation cancels, low-volume unknowns). "
-                         "Default keeps only noteworthy categories.")
-    pc.add_argument("--min-unknown-count", type=int, default=3,
-                    help="Minimum occurrence count to include unclassified errors "
-                         "(default: 3). Ignored with --all.")
+    pc.add_argument("--min-count", type=int, default=2,
+                    help="Drop error buckets with fewer than this many "
+                         "occurrences (default: 2). Set to 1 to include every "
+                         "non-blacklisted error.")
     pc.set_defaults(func=cmd_collect)
 
     pn = sub.add_parser("create", help="Create the Datadog notebook from a markdown file")
