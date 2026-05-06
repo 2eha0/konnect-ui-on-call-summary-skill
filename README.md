@@ -106,11 +106,11 @@ Trigger the skill with plain language. Examples:
 
 Claude will:
 
-1. Run the helper script (one bash call): `python3 ~/.claude/skills/konnect-ui-on-call-summary/scripts/oncall.py collect --mfe <name>`. The script does all the pup queries internally.
-2. **Print the full draft markdown to you, verbatim.**
-3. Ask: _"Want me to create the notebook in Datadog?"_
+1. Run the helper script (one bash call): `python3 ~/.claude/skills/konnect-ui-on-call-summary/scripts/oncall.py collect --mfe <name>`. The script does all the pup + gh queries internally.
+2. **Print the full draft markdown to you, verbatim.** The Incidents section is a `_TODO_` placeholder.
+3. Ask you about incidents (the script doesn't auto-fetch them) and whether to create the notebook.
 
-Reply with confirmation (`yes`, `好的`, `创建吧`, `go ahead`, …) and a second bash call (`oncall.py create …`) creates the notebook and prints the URL. Reply with edits (`add a CI section about flaky test X`, `drop the 404 entry`, …) and the draft is updated before re-asking.
+Reply with the incident list (or "none") plus confirmation (`yes`, `好的`, `创建吧`, `go ahead`, …). Claude updates the markdown buffer and a second bash call (`oncall.py create …`) creates the notebook and prints the URL. Reply with edits (`add a CI note about flaky test X`, `drop the 404 entry`, …) and the draft is updated before re-asking.
 
 If you want to skip the preview and create immediately, say so explicitly: _"create it without previewing."_ (Default behavior is always preview-first.)
 
@@ -134,7 +134,7 @@ The format is fixed by `scripts/oncall.py` — every report has the same three s
 
 | Section | Content |
 |---------|---------|
-| **Incidents** | Datadog incidents created during the window. Empty section says `No incidents affecting <MFE> in this period.` |
+| **Incidents** | TODO placeholder — the script does **not** auto-fetch incidents. You (or Claude during preview) fill this in with any incidents that affected the MFE, or replace the placeholder with `No incidents affecting <MFE> in this period.` |
 | **Errors** | One subsection per non-blacklisted RUM error bucket. Each has a DD deep link (2-minute window around a representative event) and one line: `<N> occurrences.` Title is the first line of the raw error message, capped at 120 chars. |
 | **CI** | Failed CI runs on `main` of `kong-konnect/konnect-ui-apps` affecting this MFE, queried via `gh`. The script filters to jobs named `mfe (<MFE>) / <step>` in the shared `CI` workflow plus any failed jobs in MFE-specific workflows (e.g. `Gateway Manager Plugin Tests Scheduler`). Cascade jobs (`check-dev-stage`, `check-prod-stage`, `Collect results`, `Slack Notification`) are dropped. Empty section says "No CI failures on `main` affecting `<MFE>` this week." |
 

@@ -49,7 +49,7 @@ The script:
 4. Drops buckets below `--min-count` to filter low-volume noise.
 5. Lists every remaining bucket as a section in the report, using the first line of its raw error message as the title. No further classification or canned wording.
 6. Pulls one representative event per bucket for the DD deep link.
-7. Looks up Datadog incidents in the window.
+7. Emits a TODO placeholder in the **Incidents** section — incident data is **not** auto-fetched. The user fills this in (or confirms "no incidents") during preview.
 8. Queries GitHub via `gh` for failed CI runs on `main` of `kong-konnect/konnect-ui-apps` in the window. Filters to jobs named `mfe (<MFE>) /<step>` (within the shared `CI` workflow) plus any failed jobs in MFE-specific workflows. Cascade jobs (`check-dev-stage`, `check-prod-stage`, `Collect results`, `Slack Notification`) are dropped to keep the focus on the actual broken steps.
 9. Prints the markdown report. A trailing HTML comment notes how many error events were filtered as blacklisted.
 
@@ -59,13 +59,18 @@ The CI query needs an authenticated `gh` (run `gh auth status` to verify). If `g
 
 ### Step 2 — Preview to the user
 
-Show the script's stdout exactly as printed, then ask exactly:
+Show the script's stdout exactly as printed. The Incidents section will contain a `_TODO_` placeholder — that's intentional. Ask the user **two** things in the preview:
 
-> Want me to create the notebook in Datadog?
+> Any incidents affecting `<MFE>` this week I should add? (Or just say "none" to drop the TODO.)
+> Once that's settled — want me to create the notebook in Datadog?
 
-If the user requests edits ("drop the 404 entry", "add a CI note about flaky test X"), modify the markdown buffer in your reply, save it for use in step 3, and re-ask. **Do not advance to step 3 without explicit approval.**
+Wait for a response on incidents before asking about creation. Edit the markdown buffer to:
+- Replace the TODO line with the user's incident list (bulleted), or
+- Replace the TODO line with `No incidents affecting <MFE> in this period.` if they say none.
 
-If the user says "create it without previewing" upfront, you may run step 1 and step 3 back-to-back; otherwise the default is preview-first.
+If the user requests other edits ("drop the 404 entry", "add a CI note about flaky test X"), modify the markdown buffer and re-show. **Do not advance to step 3 without explicit approval.**
+
+If the user says "create it without previewing" upfront, you may run step 1 and step 3 back-to-back, but still leave the TODO line in or strip it on a best-effort basis.
 
 ### Step 3 — Create the notebook (only after approval)
 
@@ -93,7 +98,7 @@ The script always emits this skeleton:
 ```markdown
 # Incidents
 
-<bullet list of incidents OR "No incidents affecting <MFE> in this period.">
+_TODO: List any incidents affecting <MFE> this week — replace this line with `No incidents affecting <MFE> in this period.` if none._
 
 # Errors
 

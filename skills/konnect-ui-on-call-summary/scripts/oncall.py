@@ -341,29 +341,6 @@ def fetch_ci_failures(mfe: str, start: datetime, end: datetime,
     return list(by_step.values())
 
 
-def fetch_incidents(start: datetime, end: datetime) -> list[dict]:
-    out = run_pup(["incidents", "list", "--limit", "50"])
-    items = out.get("data", {}).get("attributes", {}).get("incidents", []) or []
-    result = []
-    for i in items:
-        d = i.get("data", {}).get("attributes", {})
-        created = d.get("created", "")
-        if not created:
-            continue
-        try:
-            cdt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if start <= cdt <= end:
-            result.append({
-                "title": d.get("title") or "(no title)",
-                "severity": d.get("severity") or "UNKNOWN",
-                "status": d.get("status") or "",
-                "created": created[:10],
-            })
-    return result
-
-
 # ---------- subcommands ----------
 
 def cmd_collect(args: argparse.Namespace) -> None:
@@ -394,7 +371,6 @@ def cmd_collect(args: argparse.Namespace) -> None:
         anchor = ev["ts"] if ev and ev.get("ts") else start.strftime("%Y-%m-%dT%H:%M:%SZ")
         e["dd_link"] = dd_link(args.app_id, args.mfe, anchor)
 
-    incidents = fetch_incidents(start, end)
     ci_failures = (
         None if args.skip_ci
         else fetch_ci_failures(args.mfe, start, end, run_limit=args.ci_run_limit)
@@ -404,11 +380,10 @@ def cmd_collect(args: argparse.Namespace) -> None:
     out: list[str] = []
     out.append("# Incidents")
     out.append("")
-    if incidents:
-        for i in incidents:
-            out.append(f"- {i['created']} [{i['severity']}] {i['title']}")
-    else:
-        out.append(f"No incidents affecting {name} in this period.")
+    out.append(
+        f"_TODO: List any incidents affecting {name} this week — "
+        f'replace this line with `No incidents affecting {name} in this period.` if none._'
+    )
     out.append("")
 
     out.append("# Errors")
