@@ -60,24 +60,10 @@ Use the [`skills`](https://www.npmjs.com/package/skills) CLI to install. The pac
 
 ```bash
 # User-global (available across all projects)
-npx skills add <git-url-of-this-repo> -g
+npx skills add 2eha0/konnect-ui-on-call-summary-skill -g
 
 # Project-local
-npx skills add <git-url-of-this-repo>
-```
-
-For example, if this repo is hosted at `github.com/<your-org>/skills-konnect-ui-on-call-summary`:
-
-```bash
-npx skills add <your-org>/skills-konnect-ui-on-call-summary -g
-```
-
-### From a local checkout
-
-```bash
-git clone <git-url-of-this-repo>
-cd skills-konnect-ui-on-call-summary
-npx skills add . -g
+npx skills add 2eha0/konnect-ui-on-call-summary-skill
 ```
 
 ### Verify
