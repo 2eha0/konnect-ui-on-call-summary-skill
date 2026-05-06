@@ -124,17 +124,22 @@ The format is fixed by `scripts/oncall.py` — every report has the same three s
 | Section | Content |
 |---------|---------|
 | **Incidents** | Datadog incidents created during the window. Empty section says `No incidents affecting <MFE> in this period.` |
-| **Errors** | One subsection per RUM error category. Each has a DD deep link (filtered to a 2-minute window around a representative event) and one canned line: `<N> occurrences. <fixed wording>`. Categories are recognized by regex; unmatched messages appear as `Unknown error pattern. **Investigate.**`. Pure noise (chrome-extension errors, `Unable to preload CSS`, browser intervention warnings, ResizeObserver loops) is dropped before classification. |
-| **CI** | Defaults to `No CI issues observed during this week. Failed tests all passed on reruns.` Extend by editing the markdown during preview (Claude can append CI bullets at your direction). |
+| **Errors** | One subsection per **noteworthy** RUM error category — real bugs, performance issues, build/CSP problems. Each has a DD deep link (2-minute window around a representative event) and one canned line: `<N> occurrences. <fixed wording>`. |
+| **CI** | Defaults to `No CI issues observed during this week. Failed tests all passed on reruns.` Extend by editing the markdown during preview. |
 
-The full set of recognized categories is in `scripts/oncall.py`'s `PATTERNS` list. Each entry has a `regex` (matched against the bucket message), a fixed `title`, and fixed `wording`. First match wins.
+The default view is **focused** — matches the team's existing on-call notebooks at 3–6 categories. Routine errors (401 session timeouts, 403 permission denials, 404 stale links, navigation cancels) are tagged `noteworthy: False` and folded into a single footnote: `<!-- N additional event(s) across M expected/low-signal categories hidden — re-run with --all to include them. -->`. Pure noise (chrome-extension errors, `Unable to preload CSS`, browser intervention warnings, ResizeObserver loops) is dropped before classification.
+
+To see the full breakdown, pass `--all`. To tune the threshold for low-volume unrecognized errors, pass `--min-unknown-count N` (default 3).
+
+The full pattern list lives in `scripts/oncall.py`'s `PATTERNS`. Each entry has a `regex`, fixed `title`, fixed `wording`, and `noteworthy: bool`. First match wins.
 
 ## Customization
 
 To change patterns, descriptions, MFE display names, or the report skeleton, edit `skills/konnect-ui-on-call-summary/scripts/oncall.py`:
 
-- **Add or refine a category** — append to `PATTERNS`. Order matters; place more specific regexes first.
+- **Add or refine a category** — append to `PATTERNS`. Set `noteworthy: True` if it should always show, `False` if it's expected/routine. Order matters; place specific regexes before generic ones.
 - **Drop a noise pattern** — append to `NOISE`. Anything matching is excluded entirely.
+- **Promote an existing routine pattern** — flip `noteworthy: False → True` on the entry (e.g., if 404s suddenly become a real concern for your team).
 - **Override an MFE's display name** — extend `MFE_DISPLAY` (used in titles and notebook names).
 - **Change the report skeleton** — edit `cmd_collect` (the function that prints the markdown).
 - **Use a different RUM app** — pass `--app-id <UUID>` at the CLI, or change `KONNECT_UI_APP_ID`.

@@ -36,7 +36,13 @@ MFE_DISPLAY = {
 
 # Order matters: first match wins. Each entry classifies a RUM error message
 # bucket into a category with a fixed title and canned wording.
+#
+# `noteworthy` controls default visibility:
+#   True  — always shown (real bugs, perf issues, things requiring follow-up)
+#   False — shown only with --all (expected behavior: auth flow, navigation
+#           cancels, permission denials)
 PATTERNS = [
+    # ---- Expected / routine — hidden by default ----
     {
         "id": "session_timeout",
         "regex": re.compile(
@@ -45,21 +51,21 @@ PATTERNS = [
         ),
         "title": "AxiosError: Request failed with status code 401 (session timeout)",
         "wording": "Session timeout — user navigated to the page with an expired session.",
+        "noteworthy": False,
     },
     {
-        "id": "axios_timeout",
-        "regex": re.compile(r"AxiosError: timeout of \d+ms exceeded"),
-        "title": "AxiosError: timeout of 30000ms exceeded",
-        "wording": "Network issue or slow upstream API.",
+        "id": "axios_403",
+        "regex": re.compile(r"AxiosError[^\n]*?status code 403"),
+        "title": "AxiosError: Request failed with status code 403",
+        "wording": "Permission denied (user lacks access to the resource).",
+        "noteworthy": False,
     },
     {
-        "id": "get_computed_style",
-        "regex": re.compile(r"Failed to execute 'getComputedStyle' on 'Window'"),
-        "title": (
-            "TypeError: Failed to execute 'getComputedStyle' on 'Window': "
-            "parameter 1 is not of type 'Element'."
-        ),
-        "wording": "Component unmounted before style read. Does not affect user interaction.",
+        "id": "axios_404",
+        "regex": re.compile(r"AxiosError[^\n]*?status code 404"),
+        "title": "AxiosError: Request failed with status code 404",
+        "wording": "Resource not found (likely deleted or stale link).",
+        "noteworthy": False,
     },
     {
         "id": "canceled_dimensions",
@@ -69,31 +75,48 @@ PATTERNS = [
             "Request aborted when the user navigated away before the analytics "
             "dimensions fetch completed. Same pattern as previous weeks."
         ),
+        "noteworthy": False,
+    },
+    # ---- Real concerns — always shown ----
+    {
+        "id": "axios_timeout",
+        "regex": re.compile(r"AxiosError: timeout of \d+ms exceeded"),
+        "title": "AxiosError: timeout of 30000ms exceeded",
+        "wording": "Network issue or slow upstream API.",
+        "noteworthy": True,
     },
     {
-        "id": "axios_403",
-        "regex": re.compile(r"AxiosError[^\n]*?status code 403"),
-        "title": "AxiosError: Request failed with status code 403",
-        "wording": "Permission denied (user lacks access to the resource).",
-    },
-    {
-        "id": "axios_404",
-        "regex": re.compile(r"AxiosError[^\n]*?status code 404"),
-        "title": "AxiosError: Request failed with status code 404",
-        "wording": "Resource not found (likely deleted or stale link).",
-    },
-    {
-        "id": "undefined_property",
-        "regex": re.compile(r"Cannot read properties of undefined \(reading '([^']+)'\)"),
-        "title": "TypeError: Cannot read properties of undefined (reading '{prop}')",
-        "wording": "Frontend bug — code accesses `.{prop}` on undefined. **Investigate.**",
-        "follow_up": True,
+        "id": "get_computed_style",
+        "regex": re.compile(r"Failed to execute 'getComputedStyle' on 'Window'"),
+        "title": (
+            "TypeError: Failed to execute 'getComputedStyle' on 'Window': "
+            "parameter 1 is not of type 'Element'."
+        ),
+        "wording": "Component unmounted before style read. Does not affect user interaction.",
+        "noteworthy": True,
     },
     {
         "id": "dynamic_import_failed",
         "regex": re.compile(r"Failed to fetch dynamically imported module"),
         "title": "TypeError: Failed to fetch dynamically imported module",
         "wording": "Bundle chunk fetch failed; usually a stale client after a deploy. Self-healing on reload.",
+        "noteworthy": True,
+    },
+    {
+        "id": "csp_violation",
+        "regex": re.compile(r"csp_violation:"),
+        "title": "csp_violation: script blocked by CSP",
+        "wording": "Content Security Policy blocked a script load. **Investigate** if recurring (may indicate a CDN or asset-host config drift).",
+        "noteworthy": True,
+        "follow_up": True,
+    },
+    {
+        "id": "undefined_property",
+        "regex": re.compile(r"Cannot read properties of undefined \(reading '([^']+)'\)"),
+        "title": "TypeError: Cannot read properties of undefined (reading '{prop}')",
+        "wording": "Frontend bug — code accesses `.{prop}` on undefined. **Investigate.**",
+        "noteworthy": True,
+        "follow_up": True,
     },
 ]
 
@@ -179,12 +202,15 @@ def classify(message: str) -> dict | None:
             "title": p["title"].format(**ctx),
             "wording": p["wording"].format(**ctx),
             "follow_up": p.get("follow_up", False),
+            "noteworthy": p.get("noteworthy", True),
         }
     return {
         "id": f"unknown::{message[:60]}",
         "title": message.split("\n")[0][:120],
         "wording": "Unknown error pattern. **Investigate.**",
         "follow_up": True,
+        "noteworthy": True,  # filtered by min_unknown_count threshold below
+        "is_unknown": True,
     }
 
 
@@ -310,8 +336,26 @@ def cmd_collect(args: argparse.Namespace) -> None:
                 "count": 0,
                 "sample_message": msg,
                 "follow_up": c.get("follow_up", False),
+                "noteworthy": c.get("noteworthy", True),
+                "is_unknown": c.get("is_unknown", False),
             }
         categories[cid]["count"] += count
+
+    # Filter to "noteworthy" categories unless the user wants everything.
+    # Unknowns are kept only if they reach min-unknown-count (signal vs. noise).
+    if not args.all:
+        filtered = {}
+        for cid, c in categories.items():
+            if c["is_unknown"]:
+                if c["count"] >= args.min_unknown_count:
+                    filtered[cid] = c
+            elif c["noteworthy"]:
+                filtered[cid] = c
+        # Remember what was hidden so we can mention it in a footnote
+        hidden = {cid: c for cid, c in categories.items() if cid not in filtered}
+        categories = filtered
+    else:
+        hidden = {}
 
     for c in categories.values():
         ev = fetch_sample(args.app_id, args.mfe, c["sample_message"], start, end)
@@ -346,6 +390,15 @@ def cmd_collect(args: argparse.Namespace) -> None:
             stats = f"{c['count']} occurrence{'s' if c['count'] != 1 else ''}"
             out.append(f"{stats}. {c['wording']}")
             out.append("")
+
+    if hidden:
+        # Footnote so reviewers know what was filtered, but keep it terse.
+        hidden_total = sum(c["count"] for c in hidden.values())
+        out.append(
+            f"<!-- {hidden_total} additional event(s) across {len(hidden)} expected/low-signal "
+            f"categories hidden — re-run with `--all` to include them. -->"
+        )
+        out.append("")
 
     out.append("# CI")
     out.append("")
@@ -410,6 +463,13 @@ def main() -> None:
                     help="Monday of target week (YYYY-MM-DD). "
                          "Default: previous fully-completed Mon–Sun week.")
     pc.add_argument("--app-id", default=KONNECT_UI_APP_ID, help="RUM application ID")
+    pc.add_argument("--all", action="store_true",
+                    help="Show every category, including expected/low-signal ones "
+                         "(401, 403, 404, navigation cancels, low-volume unknowns). "
+                         "Default keeps only noteworthy categories.")
+    pc.add_argument("--min-unknown-count", type=int, default=3,
+                    help="Minimum occurrence count to include unclassified errors "
+                         "(default: 3). Ignored with --all.")
     pc.set_defaults(func=cmd_collect)
 
     pn = sub.add_parser("create", help="Create the Datadog notebook from a markdown file")

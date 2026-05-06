@@ -37,15 +37,20 @@ Optional flags:
 
 - `--week-of YYYY-MM-DD` — Monday of the target week. Default: previous fully-completed Mon–Sun week.
 - `--app-id <UUID>` — non-default RUM application ID. Default: konnect-ui (`6e430333-9e0f-4d6b-ac63-5f7d4ad9a641`), which covers gateway-manager / mesh-manager / ai-manager / analytics / etc.
+- `--all` — include expected/low-signal categories (401 session timeouts, 403/404, navigation cancels, low-volume unknowns). Default keeps only noteworthy categories.
+- `--min-unknown-count N` — minimum count for unclassified errors to appear in the default view (default 3).
 
 The script:
 
 1. Verifies pup auth (aborts with a clear message if expired).
 2. Aggregates RUM errors by `@error.message` for `service:<MFE_NAME>` in the window.
-3. Classifies each bucket against a fixed pattern table (session timeout, axios timeout, getComputedStyle race, dimension fetch cancel, dynamic-import fail, undefined-property bug, 403, 404, …) and drops noise (chrome-extension errors, preload-CSS warnings, intervention warnings, ResizeObserver loops).
-4. Pulls one representative event per category for the DD deep link (uses exact-message match, not wildcards).
-5. Looks up incidents in the window.
-6. Prints the complete markdown report to stdout in the team's fixed format.
+3. Classifies each bucket against a fixed pattern table. Each pattern is tagged `noteworthy: True/False`. **By default only noteworthy categories are shown** (real bugs, perf issues, build/CSP issues). Routine errors (auth flow, permission denials, navigation cancels) are hidden under a footnote.
+4. Drops noise outright: chrome-extension errors, preload-CSS warnings, intervention warnings, ResizeObserver loops.
+5. Pulls one representative event per shown category for the DD deep link (exact-message match).
+6. Looks up incidents in the window.
+7. Prints the markdown report to stdout in the team's fixed format. A trailing HTML comment summarizes how many events/categories were hidden.
+
+Use `--all` only when the user explicitly asks to see everything (e.g., "show me the full breakdown"). The default is the focused view that matches the team's existing on-call notebooks.
 
 ### Step 2 — Preview to the user
 
@@ -103,20 +108,21 @@ No CI issues observed during this week. Failed tests all passed on reruns.
 
 Categories the script knows:
 
-| ID | Title | Wording |
-|---|---|---|
-| `session_timeout` | `AxiosError: Request failed with status code 401 (session timeout)` | "Session timeout — user navigated to the page with an expired session." |
-| `axios_timeout` | `AxiosError: timeout of 30000ms exceeded` | "Network issue or slow upstream API." |
-| `axios_403` | `AxiosError: Request failed with status code 403` | "Permission denied (user lacks access to the resource)." |
-| `axios_404` | `AxiosError: Request failed with status code 404` | "Resource not found (likely deleted or stale link)." |
-| `get_computed_style` | `TypeError: Failed to execute 'getComputedStyle' on 'Window'…` | "Component unmounted before style read. Does not affect user interaction." |
-| `canceled_dimensions` | `Failed to fetch dimensions — CanceledError: canceled` | "Request aborted when the user navigated away…" |
-| `dynamic_import_failed` | `TypeError: Failed to fetch dynamically imported module` | "Bundle chunk fetch failed; usually a stale client after a deploy." |
-| `undefined_property` | `TypeError: Cannot read properties of undefined (reading '<prop>')` | "Frontend bug — code accesses `.<prop>` on undefined. **Investigate.**" |
+| ID | Default | Title | Wording |
+|---|---|---|---|
+| `axios_timeout` | shown | `AxiosError: timeout of 30000ms exceeded` | "Network issue or slow upstream API." |
+| `get_computed_style` | shown | `TypeError: Failed to execute 'getComputedStyle' on 'Window'…` | "Component unmounted before style read. Does not affect user interaction." |
+| `dynamic_import_failed` | shown | `TypeError: Failed to fetch dynamically imported module` | "Bundle chunk fetch failed; usually a stale client after a deploy." |
+| `csp_violation` | shown | `csp_violation: script blocked by CSP` | "Content Security Policy blocked a script load. **Investigate** if recurring." |
+| `undefined_property` | shown | `TypeError: Cannot read properties of undefined (reading '<prop>')` | "Frontend bug — code accesses `.<prop>` on undefined. **Investigate.**" |
+| `session_timeout` | hidden | `AxiosError: Request failed with status code 401 (session timeout)` | "Session timeout — user navigated to the page with an expired session." |
+| `axios_403` | hidden | `AxiosError: Request failed with status code 403` | "Permission denied." |
+| `axios_404` | hidden | `AxiosError: Request failed with status code 404` | "Resource not found." |
+| `canceled_dimensions` | hidden | `Failed to fetch dimensions — CanceledError: canceled` | "Request aborted when the user navigated away…" |
 
-Anything unmatched is shown as `### <first 120 chars of message>` with wording `Unknown error pattern. **Investigate.**`. The user often wants to drop these or rewrite them — that's a normal edit during step 2.
+Anything unmatched is shown as `### <first 120 chars of message>` with wording `Unknown error pattern. **Investigate.**` — but only if its count reaches `--min-unknown-count` (default 3). Lower-volume unknowns are folded into the hidden-categories footnote.
 
-To add or change patterns/noise rules, edit `scripts/oncall.py`'s `PATTERNS` and `NOISE` lists. Keep them ordered: first match wins.
+To add or change patterns/noise rules, edit `scripts/oncall.py`'s `PATTERNS` and `NOISE` lists. The `noteworthy` field on each pattern controls whether it shows by default. First match wins, so order patterns from most specific to most generic.
 
 ## Common pitfalls
 
