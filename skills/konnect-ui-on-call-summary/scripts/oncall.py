@@ -54,29 +54,31 @@ MFE_DISPLAY = {
     "analytics": "Analytics",
 }
 
-# Blacklist — buckets matching any of these are dropped from the report.
-# Two tiers, kept together because the dropping logic is identical:
-#
-#   1. Pure browser/extension noise (no signal value).
-#   2. Known recurring errors the team has decided don't merit weekly mention
-#      (auth/navigation/permission flow, stale-client bundle fetches, CSP
-#      hiccups, etc.).
-#
-# To stop hiding one of these, comment it out — the bucket will then appear
-# in the report with its raw message.
+# Blacklist — issues matching any of these are dropped from the report.
+# Patterns match against the combined "<error_type>: <error_message>" string
+# (the same form as each issue's title). To stop hiding one of these, comment
+# it out — the issue will then appear in the report.
 NOISE = [
     # ---- Browser / extension noise ----
     re.compile(r"chrome-extension://"),
     re.compile(r"Unable to preload CSS"),
-    re.compile(r"intervention: Ignored attempt to cancel"),
+    re.compile(r"Ignored attempt to cancel a touchmove event"),
     re.compile(r"ResizeObserver loop"),
     # ---- Known recurring, not actionable ----
-    re.compile(r"AxiosError[^\n]*?Request failed with status code 401", re.IGNORECASE),
-    re.compile(r"AxiosError[^\n]*?Request failed with status code 403"),
-    re.compile(r"AxiosError[^\n]*?Request failed with status code 404"),
-    re.compile(r"Failed to fetch dimensions[^\n]*?CanceledError: canceled"),
+    re.compile(r"Request failed with status code 401", re.IGNORECASE),
+    re.compile(r"Request failed with status code 403"),
+    re.compile(r"Request failed with status code 404"),
+    re.compile(r"Failed to fetch dimensions[^\n]*?canceled", re.IGNORECASE),
     re.compile(r"Failed to fetch dynamically imported module"),
-    re.compile(r"csp_violation:"),
+    re.compile(r"CanceledError: canceled$"),  # bare cancel, no further context
+    # CSP violations: error-tracking surfaces these with type=script-src-elem,
+    # script-src, worker-src, etc. and a "blocked by '<directive>'" message.
+    re.compile(r"^script-src(?:-elem)?:"),
+    re.compile(r"^worker-src:"),
+    re.compile(r"blocked by 'script-src"),
+    re.compile(r"blocked by 'worker-src"),
+    # ---- Browser-extension wallet/etc. noise ----
+    re.compile(r"Failed to connect to MetaMask"),
 ]
 
 
@@ -143,6 +145,21 @@ def is_blacklisted(message: str) -> bool:
     return any(n.search(message) for n in NOISE)
 
 
+# UUID v4 + similar IDs in URL paths — collapse to `<id>` so paths from
+# different tenants/resources merge into one diagnostic row.
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+
+def normalize_path(path: str, max_len: int = 90) -> str:
+    p = _UUID_RE.sub("<id>", path)
+    if len(p) > max_len:
+        p = p[: max_len - 1] + "…"
+    return p
+
+
 def run_gh(args: list[str]) -> object:
     """Best-effort `gh` invocation. Returns parsed JSON on success, None on
     any failure (gh not installed, not authenticated, network error, etc.)."""
@@ -178,78 +195,146 @@ def title_from_message(message: str) -> str:
     return (message.splitlines() or [""])[0].strip()[:120]
 
 
-def to_epoch_ms(iso: str) -> int:
-    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    return int(dt.timestamp() * 1000)
-
-
-def dd_link(app_id: str, mfe: str, anchor_iso: str) -> str:
-    ms = to_epoch_ms(anchor_iso)
-    from_ts, to_ts = ms - 60_000, ms + 60_000
-    query = (
-        f"%40type%3Aerror%20%40application.id%3A{app_id}%20env%3Aprod%20"
-        f"-%40browser.name%3AHeadlessChrome%20service%3A{mfe}%20"
-        f"-%40error.message%3A%22Unable%20to%20preload%20CSS%22%20"
-        f"-%40error.message%3Achrome-extension"
-    )
-    return (
-        f"https://app.datadoghq.com/rum/sessions?query={query}"
-        f"&agg_m=count&agg_m_source=base&agg_t=count"
-        f"&fromUser=false&refresh_mode=paused&track=rum"
-        f"&from_ts={from_ts}&to_ts={to_ts}&live=false"
-    )
-
-
 # ---------- pup queries ----------
 
-def fetch_aggregate(app_id: str, mfe: str, start: datetime, end: datetime) -> list[dict]:
-    out = run_pup([
-        "rum", "aggregate",
-        "--query", f"@type:error @application.id:{app_id} service:{mfe}",
-        "--from", start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "--to", end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "--group-by", "@error.message",
-        "--compute", "count",
-        "--limit", "50",
-    ])
-    return out.get("data", {}).get("buckets", [])
+def fetch_issues(mfe: str, start: datetime, end: datetime, limit: int = 50) -> list[dict] | None:
+    """Search Datadog Error Tracking for RUM issues with events on the MFE's
+    pages, then fetch full details for each. Returns a list of dicts with
+    the fields we use downstream (id, count, sessions, type, message,
+    file_path, first_seen_ms, last_seen_ms), or None if pup fails.
 
-
-def fetch_sample(app_id: str, mfe: str, msg: str, start: datetime, end: datetime) -> dict | None:
-    """Fetch one event matching the bucket message exactly.
-
-    Datadog wildcards do not work inside quoted strings, so we use exact
-    match. Multi-line messages are reduced to their first line; quotes and
-    backslashes are escaped. Messages are capped at 250 chars to avoid
-    pathological queries (the aggregate bucket value usually IS the full
-    message, so this is plenty for known categories).
+    We filter by `@view.url_path:*<MFE>*` (events on the MFE's pages) rather
+    than `service:<MFE>` (events emitted by code tagged with that service).
+    The URL filter is more inclusive: it captures errors from the app shell
+    or shared packages that affect users while they're on the MFE — the team
+    cares about user impact, not where the throwing module's service tag was
+    set. This also keeps issue counts consistent with the per-issue RUM
+    aggregate path query later.
     """
-    line = (msg.splitlines() or [""])[0].strip()
-    if not line:
-        return None
-    if len(line) > 250:
-        line = line[:250]
-    escaped = line.replace("\\", "\\\\").replace('"', '\\"')
-    q = (
-        f'@type:error @application.id:{app_id} service:{mfe} '
-        f'@error.message:"{escaped}"'
-    )
-    out = run_pup([
-        "rum", "events",
-        "--query", q,
+    search = run_pup([
+        "error-tracking", "issues", "search",
+        "--query", f"@view.url_path:*{mfe}*",
         "--from", start.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "--to", end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "--limit", "1",
+        "--track", "rum",
+        "--limit", str(limit),
+        "--order-by", "TOTAL_COUNT",
     ])
-    events = out.get("data", [])
-    if not events:
+    if search is None:
         return None
-    e = events[0]
-    a = e.get("attributes", {}).get("attributes", {})
-    return {
-        "ts": e.get("attributes", {}).get("timestamp", ""),
-        "url": a.get("view", {}).get("url", ""),
-    }
+    summaries = search.get("data", []) or []
+    if not summaries:
+        return []
+
+    def _enrich(s: dict) -> dict | None:
+        issue_id = s.get("id")
+        if not issue_id:
+            return None
+        det = run_pup(["error-tracking", "issues", "get", issue_id])
+        if det is None:
+            return None
+        a = det.get("data", {}).get("attributes", {})
+        return {
+            "id": issue_id,
+            "count": s.get("attributes", {}).get("total_count", 0) or 0,
+            "sessions": s.get("attributes", {}).get("impacted_sessions", 0) or 0,
+            "type": a.get("error_type", "") or "",
+            "message": a.get("error_message", "") or "",
+            "file_path": a.get("file_path", "") or "",
+            "first_seen_ms": a.get("first_seen", 0) or 0,
+            "last_seen_ms": a.get("last_seen", 0) or 0,
+        }
+
+    # Detail fetches are parallel-safe; order doesn't matter (we re-sort later).
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_enrich, summaries))
+    return [r for r in results if r is not None]
+
+
+def humanize_age(ms: int, now_ms: int) -> str:
+    """Render a millisecond timestamp as a human-readable age relative to `now_ms`."""
+    if not ms:
+        return "unknown"
+    days = (now_ms - ms) / 86_400_000
+    if days < 1:
+        return "today"
+    if days < 2:
+        return "yesterday"
+    if days < 7:
+        return f"{int(days)} days ago"
+    if days < 30:
+        weeks = int(days / 7)
+        return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+    if days < 365:
+        months = int(days / 30)
+        return f"{months} month{'s' if months != 1 else ''} ago"
+    years = int(days / 365)
+    return f"{years} year{'s' if years != 1 else ''} ago"
+
+
+def issue_link(issue_id: str, mfe: str, start: datetime, end: datetime) -> str:
+    """Return a DD Error Tracking issue URL filtered to the MFE's pages."""
+    from_ts = int(start.timestamp() * 1000)
+    to_ts = int(end.timestamp() * 1000)
+    # %40view.url_path%3A*<mfe>*
+    query = f"%40view.url_path%3A*{mfe}*"
+    return (
+        f"https://app.datadoghq.com/error-tracking/issue/{issue_id}"
+        f"?query={query}&from_ts={from_ts}&to_ts={to_ts}"
+    )
+
+
+def fetch_top_paths(app_id: str, mfe: str, error_type: str, error_message: str,
+                    start: datetime, end: datetime) -> list[dict]:
+    """Return the top affected URL paths (within the MFE) for a given error.
+
+    RUM stores `@error.message` as the FULL stringified error (with type
+    prefix for AxiosError, etc.) but error-tracking stores type and message
+    separately. We try the type-prefixed form first; on no match, fall back
+    to the bare message.
+    """
+    msg_line = (error_message.splitlines() or [""])[0].strip()
+    if not msg_line:
+        return []
+    if len(msg_line) > 250:
+        msg_line = msg_line[:250]
+
+    candidates = []
+    if error_type:
+        candidates.append(f"{error_type}: {msg_line}")
+    candidates.append(msg_line)
+
+    for candidate in candidates:
+        esc = candidate.replace("\\", "\\\\").replace('"', '\\"')
+        out = run_pup([
+            "rum", "aggregate",
+            "--query", (
+                f"@type:error @application.id:{app_id} "
+                f"@view.url_path:*{mfe}* "
+                f'@error.message:"{esc}"'
+            ),
+            "--from", start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "--to", end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "--group-by", "@view.url_path",
+            "--compute", "count",
+            "--limit", "10",
+        ])
+        if not out or not out.get("data", {}).get("buckets"):
+            continue
+        # Found matches under this candidate form; stop trying alternatives.
+        break
+    merged: dict[str, int] = {}
+    for b in out.get("data", {}).get("buckets", []) or []:
+        path = b.get("by", {}).get("@view.url_path", "")
+        cnt = b.get("computes", {}).get("c0", 0) or 0
+        if not path or not cnt:
+            continue
+        norm = normalize_path(path)
+        merged[norm] = merged.get(norm, 0) + cnt
+    return sorted(
+        [{"path": p, "count": c} for p, c in merged.items()],
+        key=lambda x: -x["count"],
+    )
 
 
 def fetch_failed_jobs(run_id: int | str) -> list[str] | None:
@@ -347,35 +432,38 @@ def cmd_collect(args: argparse.Namespace) -> None:
     ensure_authed()
     start, end, _label = resolve_week(args.week_of)
 
-    buckets = fetch_aggregate(args.app_id, args.mfe, start, end)
+    issues = fetch_issues(args.mfe, start, end)
+    if issues is None:
+        fail("error-tracking lookup failed (see pup output above).")
+
+    name = display_name(args.mfe)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = int(start.timestamp() * 1000)
 
     entries: list[dict] = []
     blacklisted_count = 0
-    for b in buckets:
-        msg = b.get("by", {}).get("@error.message", "") or ""
-        count = b.get("computes", {}).get("c0", 0) or 0
-        if not msg or count == 0:
+    for iss in issues:
+        msg = iss["message"] or ""
+        full_msg = f"{iss['type']}: {msg}" if iss["type"] else msg
+        if is_blacklisted(full_msg):
+            blacklisted_count += iss["count"]
             continue
-        if is_blacklisted(msg):
-            blacklisted_count += count
+        if iss["count"] < args.min_count:
             continue
-        if count < args.min_count:
-            continue
-        title = title_from_message(msg)
-        if not title:
-            continue
-        entries.append({"title": title, "count": count, "sample_message": msg})
+        entries.append(iss)
 
+    # Top affected paths: one pup aggregate per kept issue. Sequential is fine
+    # at this scale (typical reports have 3–10 issues).
     for e in entries:
-        ev = fetch_sample(args.app_id, args.mfe, e["sample_message"], start, end)
-        anchor = ev["ts"] if ev and ev.get("ts") else start.strftime("%Y-%m-%dT%H:%M:%SZ")
-        e["dd_link"] = dd_link(args.app_id, args.mfe, anchor)
+        e["top_paths"] = fetch_top_paths(
+            args.app_id, args.mfe, e["type"], e["message"], start, end,
+        )[:3]
+        e["dd_link"] = issue_link(e["id"], args.mfe, start, end)
 
     ci_failures = (
         None if args.skip_ci
         else fetch_ci_failures(args.mfe, start, end, run_limit=args.ci_run_limit)
     )
-    name = display_name(args.mfe)
 
     out: list[str] = []
     out.append("# Incidents")
@@ -393,12 +481,52 @@ def cmd_collect(args: argparse.Namespace) -> None:
         out.append("")
     else:
         for e in sorted(entries, key=lambda x: -x["count"]):
-            out.append(f"### {e['title']}")
+            # Title: <error_type>: <message-first-line> (matches reference style)
+            msg_short = (e["message"].splitlines() or [""])[0].strip()[:120]
+            title = f"{e['type']}: {msg_short}" if e["type"] else msg_short
+            out.append(f"### {title}")
             out.append("")
-            out.append(f"[DD Link]({e['dd_link']})")
+            out.append(f"[DD Error]({e['dd_link']})")
             out.append("")
-            stats = f"{e['count']} occurrence{'s' if e['count'] != 1 else ''}"
-            out.append(f"{stats}.")
+
+            # Stats line — count + impacted sessions + first/last seen.
+            stats_parts = [
+                f"{e['count']} occurrence{'s' if e['count'] != 1 else ''}"
+            ]
+            if e["sessions"]:
+                stats_parts.append(
+                    f"{e['sessions']} session{'s' if e['sessions'] != 1 else ''} impacted"
+                )
+            stats_line = ", ".join(stats_parts) + "."
+
+            new_this_week = e["first_seen_ms"] >= start_ms
+            if new_this_week:
+                stats_line = f"**New this week.** {stats_line}"
+            else:
+                age = humanize_age(e["first_seen_ms"], now_ms)
+                stats_line += f" First seen {age}."
+            out.append(stats_line)
+
+            top_paths = e.get("top_paths") or []
+            if top_paths:
+                paths_str = ", ".join(
+                    f"`{p['path']}` (×{p['count']})" for p in top_paths
+                )
+                out.append("")
+                out.append(f"Pages: {paths_str}.")
+
+            if e["file_path"] and not e["file_path"].startswith("../"):
+                out.append("")
+                out.append(f"Reported source: `{e['file_path']}`.")
+
+            # Diagnosis placeholder — Claude fills this in during preview
+            # with an engineer-style 1–2 sentence hypothesis using all of the
+            # facts above plus its codebase knowledge.
+            out.append("")
+            out.append(
+                "_Possible cause: TODO — replace with a 1–2 sentence "
+                "engineer-style hypothesis._"
+            )
             out.append("")
 
     if blacklisted_count:

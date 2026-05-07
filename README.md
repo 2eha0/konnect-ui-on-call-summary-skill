@@ -135,17 +135,18 @@ The format is fixed by `scripts/oncall.py` — every report has the same three s
 | Section | Content |
 |---------|---------|
 | **Incidents** | TODO placeholder — the script does **not** auto-fetch incidents. You (or Claude during preview) fill this in with any incidents that affected the MFE, or replace the placeholder with `No incidents affecting <MFE> in this period.` |
-| **Errors** | One subsection per non-blacklisted RUM error bucket. Each has a DD deep link (2-minute window around a representative event) and one line: `<N> occurrences.` Title is the first line of the raw error message, capped at 120 chars. |
+| **Errors** | One subsection per non-blacklisted Datadog Error Tracking issue. Each has the issue's deep link (`/error-tracking/issue/<uuid>`), an `<N> occurrences, <M> sessions impacted` line with first-seen age (or **New this week.** tag), an inline `Pages:` line listing top affected URL paths (UUIDs collapsed to `<id>`), and a `_Possible cause: TODO_` placeholder. Claude fills in the TODO with a 1–2 sentence engineer-style hypothesis before showing the draft to you (see [reference notebook 12138800](https://app.datadoghq.com/notebook/12138800/on-call-summary-konnect-gateway-manager-fe-makito-apr-7-14) for the team's diagnosis tone). |
 | **CI** | Failed CI runs on `main` of `kong-konnect/konnect-ui-apps` affecting this MFE, queried via `gh`. The script filters to jobs named `mfe (<MFE>) / <step>` in the shared `CI` workflow plus any failed jobs in MFE-specific workflows (e.g. `Gateway Manager Plugin Tests Scheduler`). Cascade jobs (`check-dev-stage`, `check-prod-stage`, `Collect results`, `Slack Notification`) are dropped. Empty section says "No CI failures on `main` affecting `<MFE>` this week." |
 
 ### Filtering: blacklist only
 
-The script uses a **single blacklist** (`NOISE` in `scripts/oncall.py`). Anything matching it is dropped; everything else appears in the report with its raw message. There is no whitelist, no per-category formatting, and no classification — new error patterns surface automatically.
+The script uses a **single blacklist** (`NOISE` in `scripts/oncall.py`). Anything matching it is dropped; everything else becomes a section with its raw type+message. There is no whitelist or per-category formatting — new error patterns surface automatically.
 
-The blacklist covers two tiers:
+The blacklist matches against the combined `<error_type>: <error_message>` form (the same form as each section's title) and covers:
 
-1. **Browser/extension noise** — `chrome-extension://`, `Unable to preload CSS`, `intervention: Ignored attempt to cancel`, `ResizeObserver loop`. No signal value.
-2. **Known recurring errors** — `AxiosError ... 401/403/404`, `Failed to fetch dimensions ... CanceledError: canceled`, `Failed to fetch dynamically imported module`, `csp_violation:`. The team has decided these don't merit weekly mention.
+1. **Browser/extension noise** — `chrome-extension://`, `Unable to preload CSS`, `Ignored attempt to cancel a touchmove event`, `ResizeObserver loop`, `Failed to connect to MetaMask`. No signal value.
+2. **Known recurring user-flow errors** — `Request failed with status code 401/403/404`, `Failed to fetch dimensions … canceled`, `Failed to fetch dynamically imported module`. The team has decided these don't merit weekly mention.
+3. **CSP violations** — `^script-src(?:-elem)?:`, `^worker-src:`, `blocked by 'script-src'`, `blocked by 'worker-src'`, `csp_violation:`. Recurring policy-violation noise from third-party scripts.
 
 A trailing HTML comment in the report tallies how many events were filtered: `<!-- N blacklisted event(s) filtered (see scripts/oncall.py NOISE list). -->`.
 
@@ -169,8 +170,10 @@ The trigger phrases (which determine when Claude activates the skill) live in `S
 
 ## Limitations
 
-- **Aggregation key is exact `@error.message`.** Errors that include resource IDs (e.g., `… for <uuid> …`) become many distinct buckets. Most are caught by `NOISE` regexes; the rest are listed individually.
-- **DD deep links land on a time range, not a specific event.** The link uses a 2-minute window around the representative event because pup doesn't expose the encoded `event=` token. Reviewers click through and see the matching events listed in the side panel.
+- **Diagnoses are LLM-generated speculation, not verified findings.** Each `_Possible cause_` line is a 1–2 sentence hypothesis written by Claude using the error type, message, affected pages, and codebase knowledge. They're meant as starting points for triage — confirm before acting.
+- **DD deep links go to error-tracking issues, not raw events.** The link is `https://app.datadoghq.com/error-tracking/issue/<uuid>?query=@view.url_path:*<MFE>*`. Reviewers see the issue's full event timeline filtered to the MFE's pages.
+- **Issue scope is URL-path-based.** We filter `@view.url_path:*<MFE>*` rather than `service:<MFE>` so that errors raised by the app shell or shared packages while users are on MFE pages are still surfaced (they affect MFE users even if the throwing module's service tag is `app-root`).
+- **Some issues lack a `Pages:` line.** Per-issue path queries fall back to either the type-prefixed or bare-message form against `@error.message`; if neither matches (e.g. RUM message format differs), the line is omitted.
 - **CI lookup is konnect-ui-apps-specific.** The skill hardcodes `kong-konnect/konnect-ui-apps` and the job-name convention `mfe (<MFE>) / <step>`. For a different repo or naming scheme, edit `GITHUB_REPO`, `SHARED_CI_WORKFLOW`, and the relevant filtering logic in `scripts/oncall.py`.
 - **Konnect-ui is the default RUM app.** For MFEs in other apps (admin-konnect-ui, portal-nuxt, kong-manager-oss, …), pass `--app-id`.
 
